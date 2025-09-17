@@ -1,0 +1,278 @@
+# Scheduled Data Partner Status Tracking Workflow
+# Automatically syncs Data Partner Status project field with issue labels every 15 minutes
+# Also updates status history within issue body when changes are detected
+# Per briefing/workflows/reusable.md and briefing/security/best-practices.md
+
+name: Scheduled Data Partner Status Tracking
+
+on:
+  schedule:
+    # Run every 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+# Minimal permissions
+permissions:
+  contents: read
+  issues: write
+  repository-projects: read
+
+jobs:
+  sync-all-statuses:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync All Data Partner Statuses
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ORG_ADMIN_TOKEN }}
+          script: |
+            const repoOwner = context.repo.owner;
+            const repoName = context.repo.repo;
+            
+            console.log(`Starting scheduled project status sync for ${repoOwner}/${repoName}`);
+            
+            try {
+              // Get all open data-partner issues
+              const issues = await github.rest.issues.listForRepo({
+                owner: repoOwner,
+                repo: repoName,
+                labels: 'data-partner',
+                state: 'open',
+                per_page: 100
+              });
+              
+              console.log(`Found ${issues.data.length} data-partner issues`);
+              
+              if (issues.data.length === 0) {
+                console.log('No data-partner issues found, exiting');
+                return;
+              }
+              
+              // Get projects associated with this repository
+              const projectsQuery = await github.graphql(`
+                query($owner: String!, $repo: String!) {
+                  repository(owner: $owner, name: $repo) {
+                    projectsV2(first: 5) {
+                      nodes {
+                        id
+                        title
+                        url
+                        items(first: 100) {
+                          nodes {
+                            id
+                            content {
+                              ... on Issue {
+                                id
+                                number
+                              }
+                            }
+                            fieldValues(first: 20) {
+                              nodes {
+                                ... on ProjectV2ItemFieldSingleSelectValue {
+                                  name
+                                  field {
+                                    ... on ProjectV2SingleSelectField {
+                                      name
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `, {
+                owner: repoOwner,
+                repo: repoName
+              });
+              
+              console.log(`Found ${projectsQuery.repository.projectsV2.nodes.length} projects`);
+              
+              if (projectsQuery.repository.projectsV2.nodes.length === 0) {
+                console.log('No projects found, exiting');
+                return;
+              }
+              
+              // Build a map of issue number -> project status
+              const issueStatusMap = new Map();
+              
+              for (const project of projectsQuery.repository.projectsV2.nodes) {
+                console.log(`Processing project: ${project.title}`);
+                
+                for (const item of project.items.nodes) {
+                  if (item.content && item.content.number) {
+                    const issueNumber = item.content.number;
+                    
+                    // Look for Data Partner Status field
+                    for (const fieldValue of item.fieldValues.nodes) {
+                      if (fieldValue.field && fieldValue.field.name === 'Data Partner Status') {
+                        issueStatusMap.set(issueNumber, fieldValue.name);
+                        console.log(`  Issue #${issueNumber}: ${fieldValue.name}`);
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+              
+              // Status label mapping
+              const statusLabels = {
+                'Preparation': 'status:preparation',
+                'Analysis': 'status:analysis', 
+                'Results': 'status:results'
+              };
+              
+              let syncedCount = 0;
+              let updatedCount = 0;
+              
+              // Process each data-partner issue
+              for (const issue of issues.data) {
+                const issueNumber = issue.number;
+                const projectStatus = issueStatusMap.get(issueNumber);
+                
+                if (!projectStatus) {
+                  console.log(`⚠️  Issue #${issueNumber} not found in any project or no status field`);
+                  continue;
+                }
+                
+                const targetLabel = statusLabels[projectStatus];
+                if (!targetLabel) {
+                  console.log(`⚠️  Unknown project status for issue #${issueNumber}: ${projectStatus}`);
+                  continue;
+                }
+                
+                // Check current labels
+                const currentLabels = issue.labels.map(label => label.name);
+                const currentStatusLabels = Object.values(statusLabels).filter(label => 
+                  currentLabels.includes(label)
+                );
+                
+                syncedCount++;
+                
+                // Check if labels need updating
+                if (currentStatusLabels.includes(targetLabel) && currentStatusLabels.length === 1) {
+                  console.log(`✅ Issue #${issueNumber} already has correct label: ${targetLabel}`);
+                  continue;
+                }
+                
+                // Update labels and status history
+                console.log(`🔄 Updating issue #${issueNumber} status and labels:`);
+                console.log(`   Project status: ${projectStatus}`);
+                console.log(`   Current labels: ${currentStatusLabels.join(', ') || 'none'}`);
+                console.log(`   Target label: ${targetLabel}`);
+                
+                // Get current issue details for status history update
+                const currentIssue = await github.rest.issues.get({
+                  owner: repoOwner,
+                  repo: repoName,
+                  issue_number: issueNumber
+                });
+                
+                const currentBody = currentIssue.data.body || '';
+                const currentDate = new Date().toISOString().split('T')[0];
+                
+                // Parse current status and calculate days
+                let currentStatus = 'Preparation'; // default
+                let daysInPreviousStatus = 0;
+                
+                // Extract current status from body
+                const statusMatch = currentBody.match(/Current Status:\*\* (.+)/);
+                if (statusMatch) {
+                  currentStatus = statusMatch[1].trim();
+                }
+                
+                // Extract last status change date from status history
+                const historyMatch = currentBody.match(/- (\d{4}-\d{2}-\d{2}): .+ status "([^"]+)"/g);
+                if (historyMatch && historyMatch.length > 0) {
+                  const lastEntry = historyMatch[historyMatch.length - 1];
+                  const lastDateMatch = lastEntry.match(/- (\d{4}-\d{2}-\d{2})/);
+                  if (lastDateMatch) {
+                    const statusDate = lastDateMatch[1];
+                    const lastStatusDate = new Date(statusDate);
+                    const today = new Date(currentDate);
+                    daysInPreviousStatus = Math.floor((today - lastStatusDate) / (1000 * 60 * 60 * 24));
+                  }
+                }
+                
+                // Only update if status actually changed
+                if (currentStatus !== projectStatus) {
+                  // Update the issue body with new status and history
+                  let updatedBody = currentBody;
+                  
+                  // Update current status
+                  updatedBody = updatedBody.replace(
+                    /Current Status:\*\* .+/,
+                    `Current Status:** ${projectStatus}`
+                  );
+                  
+                  // Update days in status to 0 (just changed)
+                  updatedBody = updatedBody.replace(
+                    /Days in Status: \d+/,
+                    'Days in Status: 0'
+                  );
+                  
+                  // Add to status history
+                  const newHistoryEntry = `- ${currentDate}: Changed status from "${currentStatus}" to "${projectStatus}" (${daysInPreviousStatus} days in previous status)`;
+                  
+                  if (updatedBody.includes('**Status History**')) {
+                    // Add new entry to existing history
+                    updatedBody = updatedBody.replace(
+                      /(\*\*Status History\*\*\n)((?:- .+\n)*)/,
+                      `$1$2${newHistoryEntry}\n`
+                    );
+                  } else {
+                    // Add new status history section
+                    const historySection = `\n**Status History**\n${newHistoryEntry}\n`;
+                    updatedBody = updatedBody.replace(
+                      /---\n\n\*This is a Data Partner tracking issue/,
+                      `${historySection}\n---\n\n*This is a Data Partner tracking issue`
+                    );
+                  }
+                  
+                  // Update the issue body
+                  await github.rest.issues.update({
+                    owner: repoOwner,
+                    repo: repoName,
+                    issue_number: issueNumber,
+                    body: updatedBody
+                  });
+                  
+                  console.log(`   ✅ Updated status history: ${currentStatus} -> ${projectStatus} (${daysInPreviousStatus} days)`);
+                }
+                
+                // Remove old status labels and add new one
+                const labelsToKeep = currentLabels.filter(label => 
+                  !Object.values(statusLabels).includes(label)
+                );
+                const newLabels = [...labelsToKeep, targetLabel];
+                
+                await github.rest.issues.update({
+                  owner: repoOwner,
+                  repo: repoName,
+                  issue_number: issueNumber,
+                  labels: newLabels
+                });
+                
+                console.log(`   ✅ Updated labels for issue #${issueNumber}`);
+                updatedCount++;
+                
+                // Brief delay between API calls
+                await new Promise(resolve => setTimeout(resolve, 100));
+              }
+              
+              console.log(`📊 Sync Summary:`);
+              console.log(`   Issues processed: ${syncedCount}`);
+              console.log(`   Labels updated: ${updatedCount}`);
+              console.log(`   ✅ Scheduled sync completed successfully`);
+              
+            } catch (error) {
+              console.error('❌ Error during scheduled sync:', error);
+              // Don't fail the workflow, just log the error
+              console.log('Sync will retry in 15 minutes');
+            }

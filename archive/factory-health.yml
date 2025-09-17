@@ -1,0 +1,207 @@
+name: Factory Health Digest
+
+on:
+  schedule:
+    - cron: "5 14 * * 1"  # Monday 9:05 AM ET (14:05 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  health_digest:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+      ORG_LOGIN: ${{ secrets.ORG_LOGIN }}
+      FACTORY_PROJECT_NUMBER: ${{ secrets.FACTORY_PROJECT_NUMBER }}
+    
+    steps:
+      - name: Query Factory project data
+        id: factory_data
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.GH_TOKEN }}
+          script: |
+            const factoryNumber = parseInt(process.env.FACTORY_PROJECT_NUMBER, 10);
+            const orgLogin = process.env.ORG_LOGIN;
+            
+            console.log(`Querying Factory project ${factoryNumber} for ${orgLogin}`);
+            
+            try {
+              // Query the Factory project using GraphQL
+              const query = `
+                query($login: String!, $num: Int!) {
+                  user(login: $login) {
+                    projectV2(number: $num) {
+                      id
+                      title
+                      items(first: 100) {
+                        nodes {
+                          id
+                          fieldValues(first: 20) {
+                            nodes {
+                              ... on ProjectV2ItemFieldTextValue {
+                                text
+                                field {
+                                  ... on ProjectV2Field {
+                                    name
+                                  }
+                                }
+                              }
+                              ... on ProjectV2ItemFieldSingleSelectValue {
+                                name
+                                field {
+                                  ... on ProjectV2Field {
+                                    name
+                                  }
+                                }
+                              }
+                              ... on ProjectV2ItemFieldDateValue {
+                                date
+                                field {
+                                  ... on ProjectV2Field {
+                                    name
+                                  }
+                                }
+                              }
+                              ... on ProjectV2ItemFieldNumberValue {
+                                number
+                                field {
+                                  ... on ProjectV2Field {
+                                    name
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+              
+              const result = await github.graphql(query, {
+                login: orgLogin,
+                num: factoryNumber
+              });
+              
+              const project = result.user.projectV2;
+              if (!project) {
+                core.setFailed(`Factory project ${factoryNumber} not found for user ${orgLogin}`);
+                return;
+              }
+              
+              const items = project.items.nodes;
+              console.log(`Found ${items.length} items in Factory`);
+              
+              // Process items to extract field data
+              const studies = items.map(item => {
+                const fields = {};
+                item.fieldValues.nodes.forEach(fv => {
+                  if (fv.field && fv.field.name) {
+                    if (fv.text !== undefined) fields[fv.field.name] = fv.text;
+                    else if (fv.name !== undefined) fields[fv.field.name] = fv.name;
+                    else if (fv.date !== undefined) fields[fv.field.name] = fv.date;
+                    else if (fv.number !== undefined) fields[fv.field.name] = fv.number;
+                  }
+                });
+                return fields;
+              });
+              
+              console.log('Processed studies:', studies.length);
+              core.setOutput('studies', JSON.stringify(studies));
+              return studies;
+              
+            } catch (error) {
+              console.error('Error querying Factory:', error);
+              core.setFailed(`Failed to query Factory: ${error.message}`);
+            }
+
+      - name: Generate health report
+        id: report
+        run: |
+          studies='${{ steps.factory_data.outputs.studies }}'
+          
+          if [[ -z "$studies" || "$studies" == "null" ]]; then
+            echo "No Factory data available, generating basic report"
+            echo "## 📊 Factory Health Report - $(date +'%B %d, %Y')" > report.md
+            echo "" >> report.md
+            echo "⚠️ No Factory data available or Factory query failed." >> report.md
+            echo "" >> report.md
+            echo "_Generated automatically by Factory Health workflow_" >> report.md
+          else
+            echo "## 📊 Factory Health Report - $(date +'%B %d, %Y')" > report.md
+            echo "" >> report.md
+            
+            # Count by stage
+            echo "### Studies by Stage" >> report.md
+            echo "$studies" | jq -r '
+              group_by(.Stage // "Unknown") | 
+              map({stage: .[0].Stage // "Unknown", count: length}) | 
+              sort_by(.stage) | 
+              .[] | 
+              "- **\(.stage)**: \(.count)"
+            ' >> report.md
+            echo "" >> report.md
+            
+            # Partner statistics
+            echo "### Partner Statistics" >> report.md
+            total_partners=$(echo "$studies" | jq '[.[] | .["Partner Count"] // 0] | add')
+            avg_partners=$(echo "$studies" | jq '[.[] | .["Partner Count"] // 0] | if length > 0 then (add / length | floor) else 0 end')
+            echo "- **Total Partners across all studies**: $total_partners" >> report.md
+            echo "- **Average Partners per study**: $avg_partners" >> report.md
+            echo "" >> report.md
+            
+            # Overdue studies
+            echo "### ⚠️ Overdue Studies" >> report.md
+            today=$(date +%Y-%m-%d)
+            overdue=$(echo "$studies" | jq --arg today "$today" '
+              map(select(.["Target Date"] and .["Target Date"] < $today)) | 
+              length
+            ')
+            
+            if [ "$overdue" -gt 0 ]; then
+              echo "$studies" | jq --arg today "$today" -r '
+                map(select(.["Target Date"] and .["Target Date"] < $today)) | 
+                .[] | 
+                "- **\(.Lead // "Unknown")** (\(.["Lead Site"] // "Unknown")): Target \(.["Target Date"]) - Stage: \(.Stage // "Unknown")"
+              ' >> report.md
+            else
+              echo "🎉 No overdue studies!" >> report.md
+            fi
+            echo "" >> report.md
+            
+            # Recent activity summary
+            echo "### 📈 Summary" >> report.md
+            total_studies=$(echo "$studies" | jq 'length')
+            echo "- **Total Active Studies**: $total_studies" >> report.md
+            echo "- **Overdue Studies**: $overdue" >> report.md
+            echo "" >> report.md
+            echo "_Generated automatically by Factory Health workflow_" >> report.md
+          fi
+
+      - name: Create or update health digest issue
+        run: |
+          # Check if there's an existing health digest issue this week
+          week_start=$(date -d "last monday" +%Y-%m-%d)
+          title="Factory Health Digest - Week of $week_start"
+          
+          existing=$(gh issue list --search "Factory Health Digest in:title" --state open --json number --jq '.[0].number // empty')
+          
+          if [[ -n "$existing" ]]; then
+            # Update existing issue
+            echo "📝 Updating existing digest issue #$existing"
+            gh issue comment "$existing" --body "$(cat report.md)"
+          else
+            # Create new issue
+            echo "📝 Creating new digest issue"
+            gh issue create \
+              --title "$title" \
+              --body "$(cat report.md)" \
+              --label "factory-health"
+          fi
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}

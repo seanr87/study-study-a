@@ -1,0 +1,30 @@
+# Data Partner Management Workflow
+# Triggers when data_partners.csv is modified to create Data Partner Issues
+# Per briefing/workflows/reusable.md and briefing/security/best-practices.md
+
+name: Manage Data Partners
+
+on:
+  push:
+    paths:
+      - '._ADD_DATA_PARTNERS_/data_partners.csv'
+  workflow_dispatch:
+
+# Per briefing/actions/permissions.md - minimal permissions
+permissions:
+  contents: read
+  issues: write
+  repository-projects: write
+
+jobs:
+  manage-data-partners:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Process Data Partners
+        uses: ./.github/actions/manage-data-partners
+        with:
+          csv_path: '._ADD_DATA_PARTNERS_/data_partners.csv'
+          org_token: ${{ secrets.ORG_ADMIN_TOKEN }}

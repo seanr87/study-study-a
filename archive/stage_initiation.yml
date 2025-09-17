@@ -1,0 +1,21 @@
+name: "Stage: Initiation"
+description: Checklist to kickoff and organize the study
+title: "Stage: Initiation"
+labels: ["stage:initiation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Complete these items; then **close** this issue to advance to Protocol Development.
+        *This is the initial setup phase for your study.*
+  - type: checkboxes
+    id: accept
+    attributes:
+      label: Acceptance criteria
+      options:
+        - label: "Study repository created and configured"
+        - label: "Study lead assigned and has repository access"
+        - label: "Initial team members identified"
+        - label: "Factory project item created and linked"
+        - label: "Target timeline established"
+        - label: "Initial study objectives documented"

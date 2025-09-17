@@ -1,0 +1,435 @@
+name: Update Factory Objective
+
+# Triggers when status-tracking issues are modified or closed in study repositories
+# Updates the corresponding Factory issue's Objective field to the next milestone
+on:
+  issues:
+    types: [closed, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  repository-projects: read
+
+jobs:
+  update-factory-objective:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for required secret
+        run: |
+          if [ -z "${{ secrets.ORG_ADMIN_TOKEN }}" ]; then
+            echo "❌ ORG_ADMIN_TOKEN secret not configured"
+            echo "Please configure this secret in repository settings with a token that has:"
+            echo "- Read/write access to Factory repository issues"
+            echo "- Read/write access to organization projects"
+            exit 1
+          else
+            echo "✅ ORG_ADMIN_TOKEN secret found"
+          fi
+          
+      - name: Update Factory Objective field
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ORG_ADMIN_TOKEN }}
+          script: |
+            const studyRepo = "${{ github.repository }}";
+            
+            console.log(`Analyzing status-tracking issues in: ${studyRepo}`);
+            console.log(`Trigger: ${{ github.event_name }}`);
+            
+            try {
+              // Get all status-tracking issues in this repository
+              const statusIssues = await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels: 'status-tracking',
+                state: 'all',
+                per_page: 100
+              });
+              
+              console.log(`Found ${statusIssues.data.length} status-tracking issues`);
+              
+              if (statusIssues.data.length === 0) {
+                console.log('❌ No status-tracking issues found in this repository');
+                return;
+              }
+              
+              // Find Factory issue link from any status issue
+              let factoryOwner = null;
+              let factoryIssueNumber = null;
+              
+              for (const issue of statusIssues.data) {
+                const factoryLinkMatch = issue.body?.match(/https:\/\/github\.com\/([^\/]+)\/Factory\/issues\/(\d+)/i);
+                if (factoryLinkMatch) {
+                  factoryOwner = factoryLinkMatch[1];
+                  factoryIssueNumber = factoryLinkMatch[2];
+                  break;
+                }
+              }
+              
+              if (!factoryOwner || !factoryIssueNumber) {
+                console.log('❌ Could not find Factory issue link in any status-tracking issue');
+                console.log('Looking for pattern: https://github.com/{owner}/Factory/issues/{number}');
+                return;
+              }
+              
+              console.log(`Found Factory issue: ${factoryOwner}/Factory#${factoryIssueNumber}`);
+              
+              // Load objective mapping configuration from Factory repo
+              const configResponse = await github.rest.repos.getContent({
+                owner: factoryOwner,
+                repo: 'Factory',
+                path: '.github/data/study-status-issues.json'
+              });
+              
+              const configContent = Buffer.from(configResponse.data.content, 'base64').toString('utf-8');
+              const config = JSON.parse(configContent);
+              
+              // Determine current objective based on which issues are closed
+              const sortedIssues = config.issues.sort((a, b) => a.order - b.order);
+              let currentObjective = sortedIssues[0].factory_objective; // Default to first objective
+              
+              for (const configIssue of sortedIssues) {
+                const matchingIssue = statusIssues.data.find(issue => 
+                  issue.title === configIssue.title || 
+                  issue.title.includes(configIssue.factory_objective)
+                );
+                
+                if (matchingIssue && matchingIssue.state === 'closed') {
+                  // Find the next objective after this closed issue
+                  const nextConfigIssue = sortedIssues.find(ci => ci.order === configIssue.order + 1);
+                  currentObjective = nextConfigIssue ? nextConfigIssue.factory_objective : 'Complete';
+                } else if (matchingIssue && matchingIssue.state === 'open') {
+                  // This issue is still open, so we're still on this objective
+                  currentObjective = configIssue.factory_objective;
+                  break;
+                }
+              }
+              
+              console.log(`Determined objective: ${currentObjective}`);
+              
+              // Get Factory issue to find its node_id
+              const factoryIssue = await github.rest.issues.get({
+                owner: factoryOwner,
+                repo: 'Factory',
+                issue_number: parseInt(factoryIssueNumber)
+              });
+              
+              const issueNodeId = factoryIssue.data.node_id;
+              
+              // Get Factory project using URL (preferred method)
+              let portfolioProject = null;
+              const factoryProjectUrl = "${{ vars.FACTORY_PROJECT_URL }}";
+              
+              if (factoryProjectUrl) {
+                console.log(`Using Factory project URL: ${factoryProjectUrl}`);
+                
+                // Parse project URL to get owner and project number
+                // Supports: https://github.com/orgs/owner/projects/1 or https://github.com/users/owner/projects/1
+                const urlMatch = factoryProjectUrl.match(/github\.com\/(?:orgs|users)\/([^\/]+)\/projects\/(\d+)/);
+                
+                if (urlMatch) {
+                  const projectOwner = urlMatch[1];
+                  const projectNumber = parseInt(urlMatch[2]);
+                  
+                  console.log(`Parsed project: owner=${projectOwner}, number=${projectNumber}`);
+                  
+                  try {
+                    // Try organization first
+                    const orgProjectQuery = `
+                      query($login: String!, $num: Int!) {
+                        organization(login: $login) {
+                          projectV2(number: $num) {
+                            id
+                            title
+                            fields(first: 20) {
+                              nodes {
+                                ... on ProjectV2SingleSelectField {
+                                  id
+                                  name
+                                  options {
+                                    id
+                                    name
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    `;
+                    
+                    const orgResult = await github.graphql(orgProjectQuery, {
+                      login: projectOwner,
+                      num: projectNumber
+                    });
+                    
+                    portfolioProject = orgResult.organization?.projectV2;
+                    
+                  } catch (orgError) {
+                    console.log('Organization query failed, trying user projects...');
+                    
+                    // Try user projects
+                    const userProjectQuery = `
+                      query($login: String!, $num: Int!) {
+                        user(login: $login) {
+                          projectV2(number: $num) {
+                            id
+                            title
+                            fields(first: 20) {
+                              nodes {
+                                ... on ProjectV2SingleSelectField {
+                                  id
+                                  name
+                                  options {
+                                    id
+                                    name
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    `;
+                    
+                    const userResult = await github.graphql(userProjectQuery, {
+                      login: projectOwner,
+                      num: projectNumber
+                    });
+                    
+                    portfolioProject = userResult.user?.projectV2;
+                  }
+                } else {
+                  console.log('⚠️ Invalid Factory project URL format');
+                }
+              } else {
+                console.log('⚠️ FACTORY_PROJECT_URL variable not set, falling back to search');
+              }
+              
+              // Fallback to search method if URL method failed
+              if (!portfolioProject) {
+                console.log('🔍 Using fallback search method...');
+                
+                try {
+                  const orgProjects = await github.graphql(`
+                    query($org: String!) {
+                      organization(login: $org) {
+                        projectsV2(first: 20) {
+                          nodes {
+                            id
+                            title
+                            fields(first: 20) {
+                              nodes {
+                                ... on ProjectV2SingleSelectField {
+                                  id
+                                  name
+                                  options {
+                                    id
+                                    name
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  `, { org: factoryOwner });
+                  
+                  // Find project with Objective field
+                  for (const project of orgProjects.organization.projectsV2.nodes) {
+                    const hasObjectiveField = project.fields.nodes.some(field => field.name === 'Objective');
+                    if (hasObjectiveField) {
+                      console.log(`Found project with Objective field: ${project.title}`);
+                      portfolioProject = project;
+                      break;
+                    }
+                  }
+                  
+                } catch (searchError) {
+                  console.log('Organization search failed');
+                }
+              }
+              
+              if (!portfolioProject) {
+                console.log('❌ Factory project not found');
+                console.log('Please set FACTORY_PROJECT_URL variable in this repository');
+                console.log('Example: https://github.com/orgs/yourorg/projects/1');
+                return;
+              }
+              
+              console.log(`Found project: ${portfolioProject.title}`);
+              
+              // Get the project item for the Factory issue first to check current objective
+              const projectItems = await github.graphql(`
+                query($projectId: ID!) {
+                  node(id: $projectId) {
+                    ... on ProjectV2 {
+                      items(first: 100) {
+                        nodes {
+                          id
+                          content {
+                            ... on Issue {
+                              id
+                              number
+                              title
+                            }
+                          }
+                          fieldValues(first: 20) {
+                            nodes {
+                              ... on ProjectV2ItemFieldSingleSelectValue {
+                                field {
+                                  ... on ProjectV2SingleSelectField {
+                                    name
+                                  }
+                                }
+                                name
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `, {
+                projectId: portfolioProject.id
+              });
+              
+              const projectItem = projectItems.node.items.nodes.find(
+                item => item.content && item.content.id === issueNodeId
+              );
+              
+              if (!projectItem) {
+                console.log(`❌ Factory issue not found in project`);
+                console.log(`Issue node ID: ${issueNodeId}`);
+                console.log(`Looking for issue #${factoryIssueNumber}`);
+                return;
+              }
+              
+              // Get current objective value from project item
+              const currentObjectiveValue = projectItem.fieldValues.nodes.find(
+                fieldValue => fieldValue.field && fieldValue.field.name === 'Objective'
+              );
+              
+              const existingObjective = currentObjectiveValue ? currentObjectiveValue.name : null;
+              console.log(`Current objective in project: ${existingObjective}`);
+              console.log(`Calculated objective: ${currentObjective}`);
+              
+              // Skip if objective hasn't changed
+              if (existingObjective === currentObjective) {
+                console.log(`✅ Objective unchanged (${currentObjective}), skipping update and comment`);
+                return;
+              }
+              
+              // Find the Objective field
+              const objectiveField = portfolioProject.fields.nodes.find(
+                field => field.name === 'Objective'
+              );
+              
+              if (!objectiveField) {
+                console.log('❌ Objective field not found in project');
+                console.log('Available fields:', portfolioProject.fields.nodes.map(f => f.name).join(', '));
+                return;
+              }
+              
+              // Find the objective option
+              const objectiveOption = objectiveField.options.find(
+                option => option.name === currentObjective
+              );
+              
+              if (!objectiveOption) {
+                console.log(`❌ Objective option '${currentObjective}' not found`);
+                console.log('Available options:', objectiveField.options.map(o => o.name).join(', '));
+                return;
+              }
+              
+              
+              // Update the Objective field
+              await github.graphql(`
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId,
+                    itemId: $itemId,
+                    fieldId: $fieldId,
+                    value: { singleSelectOptionId: $optionId }
+                  }) {
+                    projectV2Item {
+                      id
+                    }
+                  }
+                }
+              `, {
+                projectId: portfolioProject.id,
+                itemId: projectItem.id,
+                fieldId: objectiveField.id,
+                optionId: objectiveOption.id
+              });
+              
+              // Update Factory issue body with completion dates
+              console.log('Updating Factory issue body with Study History...');
+              
+              // Get current Factory issue body
+              const currentFactoryIssue = await github.rest.issues.get({
+                owner: factoryOwner,
+                repo: 'Factory',
+                issue_number: parseInt(factoryIssueNumber)
+              });
+              
+              let updatedBody = currentFactoryIssue.data.body;
+              
+              // Update Study History table with completion dates
+              const closedIssues = statusIssues.data.filter(issue => issue.state === 'closed');
+              
+              for (const configIssue of sortedIssues) {
+                const matchingIssue = statusIssues.data.find(issue => 
+                  issue.title === configIssue.title || 
+                  issue.title.includes(configIssue.factory_objective)
+                );
+                
+                if (matchingIssue && matchingIssue.state === 'closed') {
+                  const completionDate = new Date(matchingIssue.closed_at).toISOString().split('T')[0];
+                  const objectiveName = configIssue.factory_objective;
+                  
+                  // Update the table row for this objective
+                  const oldRow = `| ${objectiveName} | — |`;
+                  const newRow = `| [${objectiveName}](${matchingIssue.html_url}) | ${completionDate} |`;
+                  
+                  updatedBody = updatedBody.replace(oldRow, newRow);
+                  
+                  // Also handle case where objective might already be linked
+                  const linkedOldRow = `| [${objectiveName}](${matchingIssue.html_url}) | — |`;
+                  const linkedNewRow = `| [${objectiveName}](${matchingIssue.html_url}) | ${completionDate} |`;
+                  
+                  updatedBody = updatedBody.replace(linkedOldRow, linkedNewRow);
+                }
+              }
+              
+              // Update the Factory issue body
+              await github.rest.issues.update({
+                owner: factoryOwner,
+                repo: 'Factory',
+                issue_number: parseInt(factoryIssueNumber),
+                body: updatedBody
+              });
+              
+              console.log('✅ Factory issue body updated with completion dates');
+              
+              // Add a comment to the Factory issue
+              const commentBody = `🎯 **Objective Updated:** ${currentObjective}\n\n**Study Progress Update from [${studyRepo}](https://github.com/${studyRepo}):**\n- Completed milestones: ${closedIssues.length}/${statusIssues.data.length}\n- Current objective: ${currentObjective}\n\n_Objective field and Study History updated automatically by the study tracking system._`;
+              
+              await github.rest.issues.createComment({
+                owner: factoryOwner,
+                repo: 'Factory',
+                issue_number: parseInt(factoryIssueNumber),
+                body: commentBody
+              });
+              
+              console.log(`✅ Successfully updated Factory issue #${factoryIssueNumber} Objective to: ${currentObjective}`);
+              
+            } catch (error) {
+              console.error('Error updating Factory Objective:', error);
+              core.setFailed(`Failed to update Factory Objective: ${error.message}`);
+            }

@@ -1,0 +1,179 @@
+name: 'Update Data Partner Status'
+description: 'Updates Data Partner Issue status and calculates days in status'
+inputs:
+  issue_number:
+    description: 'Issue number to update'
+    required: true
+  new_status:
+    description: 'New status: Preparation, Analysis, or Results'
+    required: true
+  repo_name:
+    description: 'Repository name (optional, defaults to current repo)'
+    required: false
+  org_token:
+    description: 'Organization admin token'
+    required: true
+
+outputs:
+  days_in_previous_status:
+    description: 'Number of days in the previous status'
+    value: ${{ steps.update_status.outputs.days_in_previous_status }}
+  status_updated:
+    description: 'Whether the status was successfully updated'
+    value: ${{ steps.update_status.outputs.status_updated }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Update Data Partner Status
+      id: update_status
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.org_token }}
+        script: |
+          const issueNumber = parseInt("${{ inputs.issue_number }}");
+          const newStatus = "${{ inputs.new_status }}";
+          const repoName = "${{ inputs.repo_name }}" || context.repo.repo;
+          const repoOwner = context.repo.owner;
+          
+          console.log(`Updating Data Partner Issue #${issueNumber} status to: ${newStatus}`);
+          
+          // Validate status
+          const validStatuses = ['Preparation', 'Analysis', 'Results'];
+          if (!validStatuses.includes(newStatus)) {
+            console.log(`❌ Invalid status: ${newStatus}. Must be one of: ${validStatuses.join(', ')}`);
+            core.setFailed(`Invalid status: ${newStatus}`);
+            return;
+          }
+          
+          try {
+            // Get current issue
+            const issue = await github.rest.issues.get({
+              owner: repoOwner,
+              repo: repoName,
+              issue_number: issueNumber
+            });
+            
+            // Check if this is a data-partner issue
+            const isDataPartnerIssue = issue.data.labels.some(label => 
+              label.name === 'data-partner'
+            );
+            
+            if (!isDataPartnerIssue) {
+              console.log(`❌ Issue #${issueNumber} is not a data-partner issue`);
+              core.setFailed(`Issue is not a data-partner issue`);
+              return;
+            }
+            
+            const currentBody = issue.data.body;
+            const currentDate = new Date().toISOString().split('T')[0];
+            
+            // Parse current status and calculate days
+            let currentStatus = 'Preparation'; // default
+            let statusDate = currentDate;
+            let daysInPreviousStatus = 0;
+            
+            // Extract current status from body
+            const statusMatch = currentBody.match(/Current Status:\*\* (.+)/);
+            if (statusMatch) {
+              currentStatus = statusMatch[1].trim();
+            }
+            
+            // Extract last status change date from status history
+            const historyMatch = currentBody.match(/- (\d{4}-\d{2}-\d{2}): .+ status "([^"]+)"/g);
+            if (historyMatch && historyMatch.length > 0) {
+              const lastEntry = historyMatch[historyMatch.length - 1];
+              const lastDateMatch = lastEntry.match(/- (\d{4}-\d{2}-\d{2})/);
+              if (lastDateMatch) {
+                statusDate = lastDateMatch[1];
+                // Calculate days in current status
+                const lastStatusDate = new Date(statusDate);
+                const today = new Date(currentDate);
+                daysInPreviousStatus = Math.floor((today - lastStatusDate) / (1000 * 60 * 60 * 24));
+              }
+            }
+            
+            console.log(`Current status: ${currentStatus}`);
+            console.log(`Days in current status: ${daysInPreviousStatus}`);
+            
+            if (currentStatus === newStatus) {
+              console.log(`ℹ️  Status is already ${newStatus}, no update needed`);
+              core.setOutput('days_in_previous_status', daysInPreviousStatus.toString());
+              core.setOutput('status_updated', 'false');
+              return;
+            }
+            
+            // Update the issue body with new status and history
+            let updatedBody = currentBody;
+            
+            // Update current status
+            updatedBody = updatedBody.replace(
+              /Current Status:\*\* .+/,
+              `Current Status:** ${newStatus}`
+            );
+            
+            // Update days in status to 0 (just changed)
+            updatedBody = updatedBody.replace(
+              /Days in Status: \d+/,
+              'Days in Status: 0'
+            );
+            
+            // Add to status history
+            const newHistoryEntry = `- ${currentDate}: Changed status from "${currentStatus}" to "${newStatus}" (${daysInPreviousStatus} days in previous status)`;
+            
+            if (updatedBody.includes('**Status History**')) {
+              // Add new entry to existing history
+              updatedBody = updatedBody.replace(
+                /(\*\*Status History\*\*\n)((?:- .+\n)*)/,
+                `$1$2${newHistoryEntry}\n`
+              );
+            } else {
+              // Add new status history section
+              const historySection = `\n**Status History**\n${newHistoryEntry}\n`;
+              updatedBody = updatedBody.replace(
+                /---\n\n\*This is a Data Partner tracking issue/,
+                `${historySection}\n---\n\n*This is a Data Partner tracking issue`
+              );
+            }
+            
+            // Update the issue
+            await github.rest.issues.update({
+              owner: repoOwner,
+              repo: repoName,
+              issue_number: issueNumber,
+              body: updatedBody
+            });
+            
+            console.log(`✅ Updated issue #${issueNumber} status from ${currentStatus} to ${newStatus}`);
+            console.log(`   Previous status duration: ${daysInPreviousStatus} days`);
+            
+            // Set appropriate labels based on status
+            const statusLabels = {
+              'Preparation': 'status:preparation',
+              'Analysis': 'status:analysis', 
+              'Results': 'status:results'
+            };
+            
+            // Remove old status labels and add new one
+            const currentLabels = issue.data.labels.map(label => label.name);
+            const labelsToRemove = Object.values(statusLabels);
+            const labelsToKeep = currentLabels.filter(label => !labelsToRemove.includes(label));
+            const newLabels = [...labelsToKeep, statusLabels[newStatus]];
+            
+            await github.rest.issues.update({
+              owner: repoOwner,
+              repo: repoName,
+              issue_number: issueNumber,
+              labels: newLabels
+            });
+            
+            console.log(`✅ Updated labels: added ${statusLabels[newStatus]}`);
+            
+            // Set outputs
+            core.setOutput('days_in_previous_status', daysInPreviousStatus.toString());
+            core.setOutput('status_updated', 'true');
+            
+          } catch (error) {
+            console.error('Error updating data partner status:', error);
+            core.setFailed(`Failed to update status: ${error.message}`);
+          }

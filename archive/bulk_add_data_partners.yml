@@ -1,0 +1,56 @@
+name: "Bulk Add Data Partners"
+description: Add multiple data partners at once (one per line)
+title: "Bulk Add Data Partners"
+labels: ["bulk-add"]
+body:
+  - type: textarea
+    id: partners_list
+    attributes:
+      label: Data Partners List
+      description: |
+        Enter one data partner per line. You can optionally include contact info:
+        
+        **Format options:**
+        - Simple: `Site Name`
+        - With contact: `Site Name, @github-username, email@example.com, notes`
+        
+        **Examples:**
+        ```
+        Stanford Medicine
+        Johns Hopkins, @jhu-contact, john@jhu.edu, Has done OHDSI studies before
+        Mayo Clinic, @mayo-data
+        Emory University
+        ```
+      placeholder: |
+        Stanford Medicine, @stanford-contact, contact@stanford.edu, Previous OHDSI collaborator
+        Johns Hopkins, @jhu-user
+        Mayo Clinic
+        Emory University, @emory-contact, , Interested in cardiovascular studies
+      value: ""
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: "I understand this will create one data-partner issue per line"
+          required: true
+        - label: "I've checked for duplicates with existing data partner issues"
+          required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ## What happens next?
+        
+        After submission, automation will:
+        1. 🔄 Parse each line and create individual `data-partner` issues
+        2. 📋 Set each issue's status to **Potential**
+        3. 👥 Assign GitHub users where provided
+        4. 📊 Add all issues to the study project
+        5. 📈 Update Factory with new partner counts
+        6. 🔔 Send welcome notifications to assignees
+        
+        **Note**: This issue will be automatically closed after processing. Check the project board to see your new partner issues!

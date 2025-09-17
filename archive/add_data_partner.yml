@@ -1,0 +1,54 @@
+name: "Add Data Partner"
+description: Create a new data partner issue (one per site)
+title: "Data Partner: "
+labels: ["data-partner"]
+assignees: []
+body:
+  - type: input
+    id: site
+    attributes:
+      label: Site name
+      description: Name of the healthcare institution or data partner
+      placeholder: "e.g., Stanford Medicine, Johns Hopkins, Mayo Clinic"
+    validations:
+      required: true
+      
+  - type: input
+    id: github
+    attributes:
+      label: GitHub handle (optional)
+      description: GitHub username of the site contact (they'll be assigned to this issue)
+      placeholder: "@site-contact"
+      
+  - type: input
+    id: email
+    attributes:
+      label: Contact email (optional)
+      description: Primary email for coordinating with this site
+      placeholder: "contact@example.org"
+      
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes (optional)
+      description: Any helpful information for coordinating with this site
+      placeholder: |
+        - Previous collaborations
+        - Special requirements
+        - Contact preferences
+        - Technical capabilities
+      
+  - type: markdown
+    attributes:
+      value: |
+        ## What happens next?
+        
+        After you create this issue, automation will:
+        - ✅ Label this issue as `data-partner`
+        - ✅ Set initial status to **Potential**
+        - ✅ Add it to the study project board
+        - ✅ Assign the GitHub user if provided
+        - ✅ Send a welcome notification
+        - ✅ Update the Factory with new partner count
+        
+        Use this issue to track all coordination with this data partner throughout the study lifecycle.

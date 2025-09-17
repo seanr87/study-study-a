@@ -1,0 +1,272 @@
+name: Stage Sync → Factory
+on:
+  issues:
+    types: [closed, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  sync:
+    if: true
+    runs-on: ubuntu-latest
+    env:
+      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ github.repository }}
+      FACTORY_NUMBER: ${{ vars.FACTORY_PROJECT_NUMBER }}
+      GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+    
+    steps:
+      - name: Check if FACTORY_PROJECT_NUMBER is set
+        run: |
+          if [[ -z "${{ vars.FACTORY_PROJECT_NUMBER }}" ]]; then
+            echo "❌ FACTORY_PROJECT_NUMBER repository variable is not set"
+            echo "Please set it in Settings → Variables"
+            exit 1
+          fi
+          echo "✅ Factory project number: ${{ vars.FACTORY_PROJECT_NUMBER }}"
+
+      - name: Derive stage name from label
+        id: stage
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # For manual testing, use a default stage
+            echo "Manual trigger detected, using default stage for testing"
+            STAGE="study-diagnostics"
+            NAME="Study Diagnostics"
+          else
+            # Normal issue-based trigger
+            LABELS='${{ toJson(github.event.issue.labels) }}'
+            echo "Issue labels: $LABELS"
+            
+            STAGE=$(echo "$LABELS" | jq -r '.[] | select(.name | startswith("stage:")) | .name | split(":")[1]' | head -1)
+            echo "Extracted stage: $STAGE"
+            
+            if [[ -z "$STAGE" || "$STAGE" == "null" ]]; then
+              echo "❌ No stage label found on issue"
+              exit 1
+            fi
+            
+            # Define stage progression
+            case "$STAGE" in
+              "initiation")
+                NAME="Protocol development"  # Advance to next stage
+                ;;
+              "protocol-development")
+                NAME="Data diagnostics"
+                ;;
+              "data-diagnostics")
+                NAME="Phenotype development"
+                ;;
+              "phenotype-development")
+                NAME="Phenotype evaluation"
+                ;;
+              "phenotype-evaluation")
+                NAME="Analysis specifications"
+                ;;
+              "analysis-specifications")
+                NAME="Network execution"
+                ;;
+              "network-execution")
+                NAME="Study diagnostics"
+                ;;
+              "study-diagnostics")
+                NAME="Evidence synthesis"
+                ;;
+              "evidence-synthesis")
+                NAME="Results evaluation"
+                ;;
+              "results-evaluation")
+                NAME="Complete"  # Final stage
+                ;;
+              *)
+                # Fallback: Convert "protocol-development" -> "Protocol development"
+                NAME=$(echo "$STAGE" | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++){ $i=toupper(substr($i,1,1)) substr($i,2) }}1')
+                ;;
+            esac
+          fi
+          
+          echo "Stage name: $NAME"
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+
+      - name: Update Factory stage field
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.GH_TOKEN }}
+          script: |
+            const factoryNumber = parseInt(process.env.FACTORY_NUMBER, 10);
+            const [owner, repo] = process.env.REPO.split("/");
+            const stageName = "${{ steps.stage.outputs.name }}";
+            const repoUrl = `https://github.com/${owner}/${repo}`;
+            
+            console.log(`Looking for Factory project ${factoryNumber} for ${owner}`);
+            console.log(`Setting stage to: ${stageName}`);
+            console.log(`Repository URL: ${repoUrl}`);
+            
+            try {
+              // Query Factory project
+              const query = `
+                query($login: String!, $num: Int!) {
+                  user(login: $login) {
+                    projectV2(number: $num) {
+                      id
+                      fields(first: 50) {
+                        nodes {
+                          ... on ProjectV2Field {
+                            id
+                            name
+                          }
+                          ... on ProjectV2IterationField {
+                            id
+                            name
+                          }
+                          ... on ProjectV2SingleSelectField {
+                            id
+                            name
+                            options {
+                              id
+                              name
+                            }
+                          }
+                        }
+                      }
+                      items(first: 100) {
+                        nodes {
+                          id
+                          fieldValues(first: 50) {
+                            nodes {
+                              ... on ProjectV2ItemFieldTextValue { 
+                                text 
+                                field { 
+                                  ... on ProjectV2Field { 
+                                    id
+                                    name 
+                                  }
+                                }
+                              }
+                              ... on ProjectV2ItemFieldSingleSelectValue {
+                                name
+                                field {
+                                  ... on ProjectV2Field {
+                                    id
+                                    name
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+              
+              const result = await github.graphql(query, {
+                login: owner,
+                num: factoryNumber
+              });
+              
+              const project = result.user.projectV2;
+              if (!project) {
+                core.setFailed(`Factory project ${factoryNumber} not found for user ${owner}`);
+                return;
+              }
+              
+              const fields = Object.fromEntries(project.fields.nodes.map(f => [f.name, f]));
+              const stageField = fields["Stage"];
+              const repoField = fields["Study Repo"] || fields["Repo"];
+              
+              if (!stageField || !repoField) {
+                core.setFailed("Factory must have fields: Stage (single-select), Study Repo or Repo (text)");
+                return;
+              }
+              
+              console.log('Looking for existing Factory item...');
+              console.log('Repository URL:', repoUrl);
+              console.log('Available items:', project.items.nodes.length);
+              
+              // Find item by Repo field (handle both "Study Repo" and "Repo")
+              let item = project.items.nodes.find(n =>
+                n.fieldValues.nodes.some(v => 
+                  (v.field?.name === "Study Repo" || v.field?.name === "Repo") && 
+                  (v.text === repoUrl || v.text === `${owner}/${repo}`)
+                )
+              );
+              
+              if (!item) {
+                console.log("Creating new Factory item...");
+                const createResult = await github.graphql(`
+                  mutation($projectId: ID!, $title: String!) {
+                    addProjectV2DraftIssue(input: {
+                      projectId: $projectId,
+                      title: $title
+                    }) {
+                      projectItem { id }
+                    }
+                  }
+                `, {
+                  projectId: project.id,
+                  title: repo
+                });
+                
+                item = createResult.addProjectV2DraftIssue.projectItem;
+                
+                // Set Study Repo field
+                await github.graphql(`
+                  mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $val: String!) {
+                    updateProjectV2ItemFieldValue(input: {
+                      projectId: $projectId,
+                      itemId: $itemId,
+                      fieldId: $fieldId,
+                      value: { text: $val }
+                    }) {
+                      projectV2Item { id }
+                    }
+                  }
+                `, {
+                  projectId: project.id,
+                  itemId: item.id,
+                  fieldId: repoField.id,
+                  val: repoUrl
+                });
+              }
+              
+              // Find stage option (try exact match first, then case-insensitive)
+              let stageOption = stageField.options?.find(o => o.name === stageName);
+              if (!stageOption) {
+                stageOption = stageField.options?.find(o => o.name.toLowerCase() === stageName.toLowerCase());
+              }
+              if (!stageOption) {
+                core.setFailed(`No Stage option named '${stageName}' found in Factory. Available options: ${stageField.options?.map(o => o.name).join(', ')}`);
+                return;
+              }
+              console.log(`Matched stage '${stageName}' to option '${stageOption.name}'`);
+              
+              // Update Stage field
+              await github.graphql(`
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optId: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId,
+                    itemId: $itemId,
+                    fieldId: $fieldId,
+                    value: { singleSelectOptionId: $optId }
+                  }) {
+                    projectV2Item { id }
+                  }
+                }
+              `, {
+                projectId: project.id,
+                itemId: item.id,
+                fieldId: stageField.id,
+                optId: stageOption.id
+              });
+              
+              console.log(`✅ Updated Factory stage to: ${stageName}`);
+              
+            } catch (error) {
+              console.error('Error updating Factory:', error);
+              core.setFailed(`Failed to update Factory: ${error.message}`);
+            }

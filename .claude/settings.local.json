@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.github.com)",
+      "Bash(yamllint:*)",
+      "Bash(python3:*)",
+      "Bash(git commit:*)",
+      "Bash(git add:*)",
+      "WebSearch",
+      "Bash(git push:*)",
+      "Bash(git pull:*)",
+      "Read(//mnt/c/Users/soreill5/Factory/**)",
+      "Bash(mkdir:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

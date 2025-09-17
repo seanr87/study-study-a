@@ -1,0 +1,168 @@
+name: Weekly Partner Nudge
+on:
+  schedule:
+    - cron: "0 * * * *"   # Run hourly, we'll gate by timezone
+  workflow_dispatch:       # Allow manual trigger for testing
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  nudge:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+      NUDGE_DAY: ${{ vars.NUDGE_DAY || 'Mon' }}
+      NUDGE_HOUR_LOCAL: ${{ vars.NUDGE_HOUR_LOCAL || '9' }}
+      NUDGE_TZ: ${{ vars.NUDGE_TZ || 'America/New_York' }}
+      STALE_DAYS: ${{ vars.STALE_DAYS || '7' }}
+      STUDY_LEAD_GH: ${{ vars.STUDY_LEAD_GH || '' }}
+    
+    steps:
+      - name: Check configuration
+        run: |
+          echo "📅 Nudge configuration:"
+          echo "  Day: ${{ env.NUDGE_DAY }}"
+          echo "  Hour: ${{ env.NUDGE_HOUR_LOCAL }} (local time)"
+          echo "  Timezone: ${{ env.NUDGE_TZ }}"
+          echo "  Stale threshold: ${{ env.STALE_DAYS }} days"
+          echo "  Study lead: ${{ env.STUDY_LEAD_GH }}"
+
+      - name: Check if we should run now
+        id: gate
+        run: |
+          # Get current day and hour in the configured timezone
+          current_day=$(TZ="${{ env.NUDGE_TZ }}" date +%a)
+          current_hour=$(TZ="${{ env.NUDGE_TZ }}" date +%H)
+          target_hour=$(printf "%02d" "${{ env.NUDGE_HOUR_LOCAL }}")
+          
+          echo "Current: $current_day $current_hour:00"
+          echo "Target: ${{ env.NUDGE_DAY }} $target_hour:00"
+          
+          if [[ "$current_day" == "${{ env.NUDGE_DAY }}" && "$current_hour" == "$target_hour" ]]; then
+            echo "✅ Time to run nudge!"
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          else
+            echo "⏰ Not the scheduled time, skipping"
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Exit early if not scheduled time
+        if: steps.gate.outputs.should_run == 'false'
+        run: |
+          echo "Not the scheduled time for nudges. Exiting gracefully."
+          exit 0
+
+      - name: Find stale data partner issues
+        if: steps.gate.outputs.should_run == 'true'
+        id: stale
+        run: |
+          echo "🔍 Looking for stale data-partner issues..."
+          
+          # Calculate timestamp for stale threshold
+          stale_timestamp=$(date -d "${{ env.STALE_DAYS }} days ago" -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "Considering issues stale if not updated since: $stale_timestamp"
+          
+          # Get all open data-partner issues
+          gh api repos/${{ github.repository }}/issues \
+            --paginate \
+            --jq "map(select(.state==\"open\" and (.labels[]?.name? // \"\" | contains(\"data-partner\")) and .updated_at < \"$stale_timestamp\"))" \
+            > stale_issues.json
+          
+          stale_count=$(jq 'length' stale_issues.json)
+          echo "Found $stale_count stale partner issues"
+          
+          if [[ $stale_count -gt 0 ]]; then
+            echo "Stale issues:"
+            jq -r '.[] | "  #\(.number): \(.title) (last updated: \(.updated_at))"' stale_issues.json
+          fi
+          
+          echo "count=$stale_count" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+
+      - name: Nudge assignees on stale issues
+        if: steps.stale.outputs.count != '0'
+        run: |
+          echo "📤 Sending nudges to stale partner issues..."
+          
+          jq -c '.[]' stale_issues.json | while read -r issue; do
+            number=$(echo "$issue" | jq -r '.number')
+            title=$(echo "$issue" | jq -r '.title')
+            assignee=$(echo "$issue" | jq -r '.assignee.login // empty')
+            
+            echo "Nudging issue #$number: $title"
+            
+            if [[ -n "$assignee" && "$assignee" != "null" ]]; then
+              comment="Hi @${assignee} 👋 Gentle weekly nudge to check on progress with this data partner site. Please update this issue with any progress or blockers. Thanks!"
+            else
+              comment="📅 Weekly nudge: This data partner issue hasn't been updated recently. Please assign someone and update with current status or any blockers."
+            fi
+            
+            gh issue comment "$number" --body "$comment"
+            echo "  ✅ Nudged #$number"
+          done
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+
+      - name: Create or update weekly digest issue
+        if: steps.stale.outputs.count != '0'
+        run: |
+          echo "📊 Creating weekly partner nudge digest..."
+          
+          # Create digest content
+          {
+            echo "# Weekly Partner Nudge Digest"
+            echo ""
+            echo "**Date**: $(date '+%B %d, %Y')"
+            echo "**Stale Issues**: ${{ steps.stale.outputs.count }}"
+            echo ""
+            
+            if [[ -n "${{ env.STUDY_LEAD_GH }}" ]]; then
+              echo "Hey @${{ env.STUDY_LEAD_GH }}, here are the data partner issues that need attention:"
+              echo ""
+            fi
+            
+            echo "## 🔄 Issues needing follow-up:"
+            echo ""
+            jq -r '.[] | "- [ ] [#\(.number): \(.title)](\(.html_url))"' stale_issues.json
+            echo ""
+            echo "These issues haven't been updated in ${{ env.STALE_DAYS }}+ days. Assignees have been notified."
+            echo ""
+            echo "---"
+            echo "_Generated automatically by Weekly Partner Nudge workflow_"
+          } > digest.md
+          
+          # Check for existing digest issue this week
+          week_start=$(date -d "last monday" +%Y-%m-%d)
+          title="Weekly Partner Nudge - Week of $week_start"
+          
+          existing=$(gh issue list \
+            --search "Weekly Partner Nudge in:title" \
+            --state open \
+            --json number,title \
+            --jq ".[] | select(.title | startswith(\"Weekly Partner Nudge\")) | .number" \
+            | head -1)
+          
+          if [[ -n "$existing" ]]; then
+            echo "📝 Updating existing digest issue #$existing"
+            gh issue comment "$existing" --body "$(cat digest.md)"
+          else
+            echo "📝 Creating new digest issue"
+            gh issue create \
+              --title "$title" \
+              --body "$(cat digest.md)" \
+              --label "weekly-digest"
+          fi
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+
+      - name: Summary
+        if: steps.gate.outputs.should_run == 'true'
+        run: |
+          if [[ "${{ steps.stale.outputs.count }}" == "0" ]]; then
+            echo "🎉 No stale partner issues found! All partners are actively being tracked."
+          else
+            echo "📤 Nudged ${{ steps.stale.outputs.count }} stale partner issues and created/updated digest."
+          fi

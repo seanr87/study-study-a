@@ -1,0 +1,297 @@
+name: 'Manage Data Partners'
+description: 'Creates and manages Data Partner Issues from CSV file'
+inputs:
+  csv_path:
+    description: 'Path to data_partners.csv file'
+    required: true
+  org_token:
+    description: 'Organization admin token'
+    required: true
+
+outputs:
+  issues_created:
+    description: 'Number of new Data Partner Issues created'
+    value: ${{ steps.process_partners.outputs.issues_created }}
+  issues_updated:
+    description: 'Number of existing Data Partner Issues updated'
+    value: ${{ steps.process_partners.outputs.issues_updated }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Process Data Partners
+      id: process_partners
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.org_token }}
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          const repoOwner = context.repo.owner;
+          const repoName = context.repo.repo;
+          const csvPath = "${{ inputs.csv_path }}";
+          
+          console.log(`Processing data partners for repository: ${repoOwner}/${repoName}`);
+          console.log(`CSV file path: ${csvPath}`);
+          
+          // Check if CSV file exists
+          if (!fs.existsSync(csvPath)) {
+            console.log(`❌ CSV file not found at: ${csvPath}`);
+            core.setFailed(`CSV file not found: ${csvPath}`);
+            return;
+          }
+          
+          // Read and parse CSV file
+          const csvContent = fs.readFileSync(csvPath, 'utf8');
+          const lines = csvContent.trim().split('\n');
+          
+          if (lines.length < 2) {
+            console.log(`⚠️  CSV file is empty or has no data rows`);
+            core.setOutput('issues_created', '0');
+            core.setOutput('issues_updated', '0');
+            return;
+          }
+          
+          // Parse header row (skip first line assuming it's headers)
+          const dataRows = lines.slice(1);
+          const partners = [];
+          
+          for (const line of dataRows) {
+            // Simple CSV parsing (handles basic cases, could be enhanced for complex CSV)
+            const columns = line.split(',').map(col => col.trim().replace(/"/g, ''));
+            
+            if (columns.length >= 3) {
+              partners.push({
+                site_name: columns[0],
+                contact_name: columns[1],
+                contact_github: columns[2]
+              });
+            }
+          }
+          
+          console.log(`Found ${partners.length} data partners in CSV`);
+          
+          if (partners.length === 0) {
+            console.log(`⚠️  No valid data partners found in CSV`);
+            core.setOutput('issues_created', '0');
+            core.setOutput('issues_updated', '0');
+            return;
+          }
+          
+          // Get existing issues with data-partner label
+          const existingIssues = await github.rest.issues.listForRepo({
+            owner: repoOwner,
+            repo: repoName,
+            labels: 'data-partner',
+            state: 'all'
+          });
+          
+          console.log(`Found ${existingIssues.data.length} existing data partner issues`);
+          
+          let issuesCreated = 0;
+          let issuesUpdated = 0;
+          
+          // Find the study project ID by looking for Projects V2 linked to this repo
+          let studyProjectId = null;
+          try {
+            const projectsQuery = await github.graphql(`
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  projectsV2(first: 5) {
+                    nodes {
+                      id
+                      title
+                      url
+                    }
+                  }
+                }
+              }
+            `, {
+              owner: repoOwner,
+              repo: repoName
+            });
+            
+            if (projectsQuery.repository.projectsV2.nodes.length > 0) {
+              // Use the first project found (should be the study project)
+              studyProjectId = projectsQuery.repository.projectsV2.nodes[0].id;
+              const projectTitle = projectsQuery.repository.projectsV2.nodes[0].title;
+              console.log(`✅ Found study project: ${projectTitle} (ID: ${studyProjectId})`);
+            } else {
+              console.log(`⚠️  No Projects V2 found for repository ${repoOwner}/${repoName}`);
+            }
+          } catch (projectError) {
+            console.log(`⚠️  Could not query repository projects: ${projectError.message}`);
+          }
+          
+          // Process each data partner
+          for (const partner of partners) {
+            const issueTitle = partner.site_name;
+            
+            // Check if issue already exists
+            const existingIssue = existingIssues.data.find(issue => 
+              issue.title === issueTitle
+            );
+            
+            const issueBody = [
+              `👋 @${partner.contact_github} (${partner.contact_name}) - You've been added as the contact for this data partner.`,
+              '',
+              '---',
+              '',
+              '**Data Partner Information**',
+              `- **Site Name:** ${partner.site_name}`,
+              `- **Current Status:** Preparation`,
+              `- **Created:** ${new Date().toISOString().split('T')[0]}`,
+              '',
+              '**Status Tracking**',
+              `Days in Status: 0`,
+              '',
+              '**Status History**',
+              `- ${new Date().toISOString().split('T')[0]}: Created with status "Preparation"`,
+              '',
+              '---',
+              '',
+              '*This is a Data Partner tracking issue used by your Study Lead to monitor Network Execution.*'
+            ].join('\n');
+
+            if (existingIssue) {
+              // Update existing issue if needed
+              console.log(`📝 Existing issue found: ${issueTitle}`);
+              console.log(`   ℹ️  Issue already exists, no updates needed`);
+              
+            } else {
+              // Create new issue
+              console.log(`🆕 Creating new issue: ${issueTitle}`);
+              
+              const issueResponse = await github.rest.issues.create({
+                owner: repoOwner,
+                repo: repoName,
+                title: issueTitle,
+                body: issueBody,
+                labels: ['data-partner', 'status:preparation']
+              });
+              
+              console.log(`   ✅ Created issue: ${issueResponse.data.html_url}`);
+              
+              // Add issue to study project if found
+              if (studyProjectId) {
+                try {
+                  console.log(`   🔄 Adding to project: ${studyProjectId}`);
+                  
+                  const addResult = await github.graphql(`
+                    mutation($projectId: ID!, $contentId: ID!) {
+                      addProjectV2ItemById(input: {
+                        projectId: $projectId,
+                        contentId: $contentId
+                      }) {
+                        item {
+                          id
+                        }
+                      }
+                    }
+                  `, {
+                    projectId: studyProjectId,
+                    contentId: issueResponse.data.node_id
+                  });
+                  
+                  const itemId = addResult.addProjectV2ItemById.item.id;
+                  console.log(`   ✅ Added to project successfully (Item ID: ${itemId})`);
+                  
+                  // Set the Data Partner Status field to "Preparation"
+                  try {
+                    console.log(`   🔄 Setting Data Partner Status field to "Preparation"`);
+                    
+                    // First, get the project fields to find the Data Partner Status field ID
+                    const projectFields = await github.graphql(`
+                      query($projectId: ID!) {
+                        node(id: $projectId) {
+                          ... on ProjectV2 {
+                            fields(first: 20) {
+                              nodes {
+                                ... on ProjectV2Field {
+                                  id
+                                  name
+                                }
+                                ... on ProjectV2SingleSelectField {
+                                  id
+                                  name
+                                  options {
+                                    id
+                                    name
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    `, {
+                      projectId: studyProjectId
+                    });
+                    
+                    // Find the Data Partner Status field
+                    const statusField = projectFields.node.fields.nodes.find(field => 
+                      field.name === 'Data Partner Status'
+                    );
+                    
+                    if (statusField) {
+                      // Find the "Preparation" option
+                      const preparationOption = statusField.options?.find(option => 
+                        option.name === 'Preparation'
+                      );
+                      
+                      if (preparationOption) {
+                        await github.graphql(`
+                          mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $singleSelectOptionId: String!) {
+                            updateProjectV2ItemFieldValue(input: {
+                              projectId: $projectId,
+                              itemId: $itemId,
+                              fieldId: $fieldId,
+                              value: {
+                                singleSelectOptionId: $singleSelectOptionId
+                              }
+                            }) {
+                              projectV2Item {
+                                id
+                              }
+                            }
+                          }
+                        `, {
+                          projectId: studyProjectId,
+                          itemId: itemId,
+                          fieldId: statusField.id,
+                          singleSelectOptionId: preparationOption.id
+                        });
+                        
+                        console.log(`   ✅ Set Data Partner Status field to "Preparation"`);
+                      } else {
+                        console.log(`   ⚠️  "Preparation" option not found in Data Partner Status field`);
+                      }
+                    } else {
+                      console.log(`   ⚠️  Data Partner Status field not found in project`);
+                    }
+                  } catch (fieldError) {
+                    console.log(`   ❌ Failed to set Data Partner Status field: ${fieldError.message}`);
+                  }
+                  
+                } catch (projectError) {
+                  console.log(`   ❌ Failed to add to project: ${projectError.message}`);
+                }
+              } else {
+                console.log(`   ℹ️  No project found, skipping project assignment`);
+              }
+              
+              issuesCreated++;
+            }
+            
+            // Brief delay between operations
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+          
+          console.log(`✅ Data Partner processing completed`);
+          console.log(`   Created: ${issuesCreated} new issues`);
+          console.log(`   Updated: ${issuesUpdated} existing issues`);
+          
+          // Set outputs
+          core.setOutput('issues_created', issuesCreated.toString());
+          core.setOutput('issues_updated', issuesUpdated.toString());
